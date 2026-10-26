@@ -1,32 +1,57 @@
-# Prerequisites
-*.d
+# Build directories
+/build/
+/build-bench/
+/cmake-build-*/
 
-# Compiled Object files
-*.slo
-*.lo
+# Compiled files
 *.o
 *.obj
-
-# Precompiled Headers
-*.gch
-*.pch
-
-# Compiled Dynamic libraries
 *.so
-*.dylib
-*.dll
-
-# Fortran module files
-*.mod
-*.smod
-
-# Compiled Static libraries
-*.lai
-*.la
 *.a
-*.lib
-
-# Executables
-*.exe
 *.out
-*.app
+*.exe
+
+# Python cache
+__pycache__/
+*.pyc
+
+# LLVM intermediate files
+*.ll
+*.bc
+
+# Backups
+/backups/
+*.backup
+*.before_*
+*.pre_overhead_backup
+
+# Temporary files
+*.tmp
+*.log
+*.swp
+*~
+
+# Generated benchmark executables
+/adaptive_overhead_aware_benchmark
+/adaptive_two_phase_benchmark
+/auto_adaptation_runtime_test
+/auto_policy_completion_test
+/auto_policy_transition_test
+/final_cao_benchmark
+/modifier_compile_test
+/modifier_coverage_temp
+/modifier_temp
+/omp_baseline_benchmark
+/scheduling_modifier_test
+
+# Temporary debug outputs
+/r.r_*
+/t.t_*
+/td_icvs.*
+/th.th_*
+
+# Experimental results (retain final results)
+/benchmark_results*.csv
+
+# Local generated runtime files
+/runtime/exports/common.50.s1.ompt.optional/

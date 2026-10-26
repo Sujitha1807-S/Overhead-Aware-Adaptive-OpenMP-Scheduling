@@ -155,6 +155,9 @@ static void __kmp_for_static_init(ident_t *loc, kmp_int32 global_tid,
     return;
   }
 
+  // Remove OpenMP scheduling modifier bits before interpreting the schedule.
+  schedtype = SCHEDULE_WITHOUT_MODIFIERS(schedtype);
+
 #if OMP_40_ENABLED
   // Although there are schedule enumerations above kmp_ord_upper which are not
   // schedules for "distribute", the only ones which are useful are dynamic, so

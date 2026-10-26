@@ -65,14 +65,14 @@
 std::deque<std::shared_timed_mutex> mutexes;
 /* ----------------------------LB4OMP_extensions------------------------------- */
 
-#include "kmp_stats_timing.h" // by Ali
-#include "kmp_stats.h"   //by Ali
+
+
 #include <x86intrin.h>
 
 #define MIN(a, b) (((a)<(b))?(a):(b))
 #define MAX(a, b) (((a)>(b))?(a):(b))
 
-extern tsc_tick_count __kmp_stats_start_time; //by Ali
+
 /* ------------------------------------------------------------------------ */
 /* ------------------------------------------------------------------------ */
 #define LOOP_TIME_MEASURE_START if (getenv("KMP_TIME_LOOPS") !=NULL) { init_loop_timer(loc->psource, ub); }
@@ -105,6 +105,73 @@ const char *autoLoopName;
 
 std::unordered_map<std::string, LoopData> autoLoopData; //holds loop data
 
+// ============================================================
+// Overhead-Aware Adaptive Scheduling (AUTO option 16)
+// Separate state to preserve existing LB4OMP AUTO algorithms.
+// ============================================================
+
+struct OverheadAwareState {
+    int currentPolicy = 0;
+    int candidatePolicy = -1;
+
+    // Timing information for the current loop execution.
+    long long startTimeNs = 0;
+    long long lastExecutionTimeNs = 0;
+
+    // Accumulated execution times for candidate evaluation.
+    double baselineTimeNs = 0.0;
+    double candidateTimeNs = 0.0;
+
+    int baselineSamples = 0;
+    int candidateSamples = 0;
+
+    // Evaluation status:
+    // 0 = collecting STATIC baseline
+    // 1 = collecting GUIDED candidate
+    // 2 = evaluation completed
+    int evaluationPhase = 0;
+
+    // Measured decision computation overhead.
+    double decisionOverheadNs = 0.0;
+
+    // Accumulated policy-configuration update measurements.
+    double totalPolicyApplyNs = 0.0;
+    int policyApplySamples = 0;
+
+    // Average policy-configuration update time.
+    double averagePolicyApplyNs = 0.0;
+
+    // Estimated adaptation cost used for future decisions.
+    double adaptationCostNs = 0.0;
+
+    int completedRounds = 0;
+    int policyChanges = 0;
+};
+
+// Persistent state for each loop source location.
+// Initially used only by AUTO option 16.
+std::unordered_map<std::string, OverheadAwareState> overheadAwareLoopData;
+
+// Tracks active overhead-aware loop executions.
+// The key is the shared OpenMP dispatch buffer address.
+struct OverheadAwareActiveLoop {
+    std::string loopName;
+    long long startTimeNs = 0;
+};
+
+static std::mutex overheadAwareTrackingMutex;
+
+static std::unordered_map<const void *, OverheadAwareActiveLoop>
+    overheadAwareActiveLoops;
+
+// Return a monotonic timestamp in nanoseconds.
+static inline long long overheadAwareNowNs() {
+    timespec ts{};
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+
+    return static_cast<long long>(ts.tv_sec) * 1000000000LL
+         + static_cast<long long>(ts.tv_nsec);
+}
 
 // LB4OMP extended DLS portfolio ...scheduling techniques are ordered according to their overhead/scheduling/load balancing capacity
 std::vector<sched_type> autoDLSPortfolio{
@@ -991,6 +1058,37 @@ void auto_DLS_Search(int gtid, int N, int P, int option) {
     }
     /* --------------------- >>>> Add more Reinforcement Learning methods here <<<< ---------------*/
     /* -------------------------- END Reinforcement Learning Extensions ---------------------------*/
+    // =======================================================
+    // NEW: Overhead-Aware Adaptive Scheduling (Option 16)
+    // =======================================================
+    else if (option == 16)
+    {
+        // Overhead-aware scheduling: initial state setup.
+        // Only STATIC scheduling is enabled at this stage.
+
+        auto result = overheadAwareLoopData.emplace(
+        std::string(autoLoopName),
+        OverheadAwareState{});
+
+        OverheadAwareState &state = result.first->second;
+
+        // Initialize the state only when the loop is first encountered.
+        if (result.second) {
+            state.currentPolicy = 0;    // STATIC
+            state.candidatePolicy = -1;
+            state.completedRounds = 0;
+            state.policyChanges = 0;
+        }
+
+        autoLoopData.at(autoLoopName).cDLS = state.currentPolicy;
+
+        autoSetChunkSize(N, P);
+
+        // Keep the current implementation fixed at STATIC.
+        autoLoopData.at(autoLoopName).autoSearch = 0;
+    }
+
+    // Existing LB4OMP code continues below.
 
     else // normal LLVM auto - it will not reach to this part if chunk is higher
         // than 4
@@ -1257,7 +1355,6 @@ void __kmp_dispatch_init_algorithm(ident_t *loc, int gtid,
     kmp_info_t *th;
     kmp_team_t *team;
 
-
     LOOP_TIME_MEASURE_START
 
     // AUTO by Ali
@@ -1293,12 +1390,14 @@ typedef typename traits_t<T>::signed_t ST;
                                       team->t.t_active_level == 1;
 #endif
 #if (KMP_STATIC_STEAL_ENABLED)
-    if (SCHEDULE_HAS_NONMONOTONIC(schedule))
-        // AC: we now have only one implementation of stealing, so use it
+    if (SCHEDULE_HAS_NONMONOTONIC(schedule) &&
+        SCHEDULE_WITHOUT_MODIFIERS(schedule) == kmp_sch_static) {
+        // Use static stealing only for a nonmonotonic static schedule.
         schedule = kmp_sch_static_steal;
-    else
+    } else
 #endif
         schedule = SCHEDULE_WITHOUT_MODIFIERS(schedule);
+    // INSERT THE DIAGNOSTIC HERE
 
     /* Pick up the nomerge/ordered bits from the scheduling type */
     if ((schedule >= kmp_nm_lower) && (schedule < kmp_nm_upper)) {
@@ -1363,11 +1462,10 @@ typedef typename traits_t<T>::signed_t ST;
         pr->u.p.min_chunk = chunk;
         //------------------------LB4OMP_extensions------------------------
 
-
         if (schedule == kmp_sch_auto) {
 
             if ((chunk >= 2) &&
-                (chunk <= 15)) // AUTO by Ali, Reinforcement Learning by Luc (need <= 15)
+                (chunk <= 16)) // AUTO by Ali, Reinforcement Learning by Luc (need <= 15)
             {
                 AUTO_FLAG = 1; // Set auto flag
             } else {
@@ -1468,7 +1566,13 @@ typedef typename traits_t<T>::signed_t ST;
         }
     }
 
-// AUTO by Ali
+// Optional measurement of the automatic scheduling decision path.
+    timespec adaptationStart{};
+    bool measureAdaptation = false;
+    int previousDLS = -1;
+    int previousChunk = 0;
+
+    // AUTO by Ali
     if (AUTO_FLAG) {
 
         //only first thread will enter ...
@@ -1476,6 +1580,12 @@ typedef typename traits_t<T>::signed_t ST;
             //printf("tid: %d ...entered \n", tid);
 
             autoLoopName = loc->psource;
+
+            const char *measureEnv = getenv("LB4OMP_MEASURE_ADAPTATION");
+            if (measureEnv != nullptr && measureEnv[0] == '1') {
+                clock_gettime(CLOCK_MONOTONIC, &adaptationStart);
+                measureAdaptation = true;
+            }
 
             //check if we have data about this loop
             if (autoLoopData.find(autoLoopName) == autoLoopData.end()) //if no data about this loop
@@ -1501,10 +1611,209 @@ typedef typename traits_t<T>::signed_t ST;
                 //create a new record
                 autoLoopData.insert(std::pair<std::string, LoopData>(loc->psource, data));
             }
-            if (autoLoopData.at(autoLoopName).autoSearch == 1) //if autoSearch == 1
+
+            previousDLS = autoLoopData.at(autoLoopName).cDLS;
+            previousChunk = autoLoopData.at(autoLoopName).cChunk;
+
+            // Preserve the requested AUTO option before chunk is modified.
+            const bool overheadAwareMode = (chunk == 16);
+
+            if (autoLoopData.at(autoLoopName).autoSearch == 1)
             {
-                //printf("chunk size %d \n", chunk);
                 auto_DLS_Search(gtid, tc, nproc, chunk);
+            }
+            
+            // ============================================================
+            // Phase 2: Controlled STATIC vs GUIDED evaluation.
+            // ============================================================
+            if (overheadAwareMode) {
+                std::lock_guard<std::mutex> lock(overheadAwareTrackingMutex);
+
+                auto stateIt = overheadAwareLoopData.find(std::string(autoLoopName));
+
+                if (stateIt != overheadAwareLoopData.end()) {
+                    OverheadAwareState &state = stateIt->second;
+
+                    // completedRounds counts previously finished executions.
+                    // Thus completedRounds == 4 means round 5 is starting.
+                    if (state.completedRounds >= 4 &&
+                        state.completedRounds < 7) {
+
+                        state.currentPolicy = 3;  // GUIDED analytical
+                        state.candidatePolicy = 3;
+                        state.evaluationPhase = 1;
+
+                        autoLoopData.at(autoLoopName).cDLS = 3;
+                        autoLoopData.at(autoLoopName).cChunk = 1;
+                    }
+                    else if (state.completedRounds >= 7) {
+
+                    // Evaluate once, before round 8.
+                    if (state.evaluationPhase != 2) {
+
+                        // Start measuring the actual decision computation.
+                        const long long decisionStartNs = overheadAwareNowNs();
+
+                        const double baselineAvg =
+                            state.baselineSamples > 0
+                                ? state.baselineTimeNs / state.baselineSamples
+                                : 0.0;
+
+                        const double candidateAvg =
+                            state.candidateSamples > 0
+                                ? state.candidateTimeNs / state.candidateSamples
+                                : 0.0;
+
+                        // Number of future executions over which savings
+                        // are expected to accumulate.
+                        int reuseHorizon = 10;
+
+                        const char *horizonEnv =
+                            getenv("LB4OMP_REUSE_HORIZON");
+
+                        if (horizonEnv != nullptr) {
+                            const int configuredHorizon = atoi(horizonEnv);
+
+                            if (configuredHorizon > 0) {
+                                reuseHorizon = configuredHorizon;
+                            }
+                        }
+
+                        const double savingPerRound =
+                            (state.baselineSamples == 3 &&
+                            state.candidateSamples == 3 &&
+                            baselineAvg > candidateAvg)
+                                ? baselineAvg - candidateAvg
+                                : 0.0;
+
+                        const double expectedSavings =
+                            savingPerRound * reuseHorizon;
+
+                        // PROVISIONAL COST:
+                        // This is not yet a complete adaptation-cost measurement.
+                        // We will replace it with measured cost components.
+                        //const double provisionalCostNs = 3000.0;
+
+                        //state.adaptationCostNs = provisionalCostNs;
+
+                        // Estimated runtime decision and configuration overhead.
+                        // Uses historical measurements when available.
+                        // This is a partial adaptation-cost estimate, not total overhead.
+                        // Initial calibration obtained from repeated overhead experiments.
+                        // These estimates cover decision computation and policy configuration,
+                        // not the complete cost of candidate evaluation or runtime adaptation.
+                        const double calibratedDecisionCostNs = 125.2;
+                        const double calibratedApplyCostNs = 1641.0;
+
+                        // Use historical measurements when available.
+                        const double estimatedDecisionCostNs =
+                            state.decisionOverheadNs > 0.0
+                                ? state.decisionOverheadNs
+                                : calibratedDecisionCostNs;
+
+                        const double estimatedApplyCostNs =
+                            state.policyApplySamples > 0
+                                ? state.averagePolicyApplyNs
+                                : calibratedApplyCostNs;
+
+                        state.adaptationCostNs =
+                            estimatedDecisionCostNs + estimatedApplyCostNs;
+                        const bool switchToGuided =
+                            expectedSavings > state.adaptationCostNs;
+
+                        state.currentPolicy = switchToGuided ? 3 : 0;
+                        state.evaluationPhase = 2;
+                        
+                        // End timing before diagnostic output.
+                        const long long decisionEndNs = overheadAwareNowNs();
+
+                        state.decisionOverheadNs =
+                            static_cast<double>(decisionEndNs - decisionStartNs);
+
+                        const char *measureEnv =
+                            getenv("LB4OMP_MEASURE_ADAPTATION");
+
+                        if (measureEnv != nullptr && measureEnv[0] == '1') {
+                            std::cerr
+                                << "[LB4OMP_DECISION]"
+                                << " baseline_avg_ns=" << baselineAvg
+                                << " candidate_avg_ns=" << candidateAvg
+                                << " reuse_horizon=" << reuseHorizon
+                                << " expected_savings_ns=" << expectedSavings
+                                << " estimated_cost_ns=" << state.adaptationCostNs
+                                << " selected_policy=" << state.currentPolicy
+                                << " decision_overhead_ns=" << state.decisionOverheadNs
+                                << std::endl;
+                        }
+                    }
+                    // Measure policy configuration update time.
+                    const long long policyApplyStartNs = overheadAwareNowNs();
+
+                    // Apply the selected policy for round 8 onward.
+                    autoLoopData.at(autoLoopName).cDLS =
+                        state.currentPolicy;
+
+                    if (state.currentPolicy == 3) {
+                        autoLoopData.at(autoLoopName).cChunk = 1;
+                    } else {
+                        autoLoopData.at(autoLoopName).cChunk =
+                            static_cast<int>((tc + nproc - 1) / nproc);
+                    }
+                    const long long policyApplyEndNs = overheadAwareNowNs();
+
+                    const long long policyApplyNs =
+                        policyApplyEndNs - policyApplyStartNs;
+                    
+                    // Accumulate policy-configuration update measurements.
+                    if (policyApplyNs >= 0) {
+                        state.totalPolicyApplyNs +=
+                            static_cast<double>(policyApplyNs);
+
+                        state.policyApplySamples++;
+
+                        state.averagePolicyApplyNs =
+                            state.totalPolicyApplyNs / state.policyApplySamples;
+                    }
+
+                    const char *policyMeasureEnv =
+                        getenv("LB4OMP_MEASURE_ADAPTATION");
+
+                    if (policyMeasureEnv != nullptr &&
+                        policyMeasureEnv[0] == '1' &&
+                        state.completedRounds >= 7) {
+
+                        std::cerr
+                            << "[LB4OMP_POLICY_APPLY]"
+                            << " selected_policy=" << state.currentPolicy
+                            << " elapsed_ns=" << policyApplyNs
+                            << " average_apply_ns=" << state.averagePolicyApplyNs
+                            << " apply_samples=" << state.policyApplySamples
+                            << std::endl;
+                    }
+                }
+                }
+            }
+
+            // Record the start timestamp after state initialization.
+            // Register the overhead-aware loop execution.
+            if (overheadAwareMode && sh != nullptr) {
+                const long long startNs = overheadAwareNowNs();
+                const std::string loopName(autoLoopName);
+
+                std::lock_guard<std::mutex> lock(overheadAwareTrackingMutex);
+
+                auto stateIt = overheadAwareLoopData.find(loopName);
+
+                if (stateIt != overheadAwareLoopData.end()) {
+                    stateIt->second.startTimeNs = startNs;
+
+                    OverheadAwareActiveLoop activeLoop;
+                    activeLoop.loopName = loopName;
+                    activeLoop.startTimeNs = startNs;
+
+                    overheadAwareActiveLoops[static_cast<const void *>(sh)] =
+                        activeLoop;
+                }
             }
 
             //printf("tc: %d, tid: %d, nproc: %d \n", tc, tid, nproc);
@@ -1525,6 +1834,27 @@ typedef typename traits_t<T>::signed_t ST;
             pr->u.p.parm1 = chunk;
         }
 
+        if (measureAdaptation) {
+            timespec adaptationEnd{};
+            clock_gettime(CLOCK_MONOTONIC, &adaptationEnd);
+
+            const long long elapsedNs =
+                (static_cast<long long>(adaptationEnd.tv_sec) -
+                 static_cast<long long>(adaptationStart.tv_sec)) * 1000000000LL
+                + static_cast<long long>(adaptationEnd.tv_nsec)
+                - static_cast<long long>(adaptationStart.tv_nsec);
+
+            std::cerr << "[LB4OMP_ADAPT]"
+                      << " elapsed_ns=" << elapsedNs
+                      << " previous_dls=" << previousDLS
+                      << " selected_dls=" << autoLoopData.at(autoLoopName).cDLS
+                      << " previous_chunk=" << previousChunk
+                      << " selected_chunk=" << chunk
+                      << " policy_changed="
+                      << (previousDLS != autoLoopData.at(autoLoopName).cDLS)
+                      << " chunk_changed=" << (previousChunk != chunk)
+                      << std::endl;
+        }
 
     } //end auto flag
 
@@ -6460,7 +6790,99 @@ static int __kmp_dispatch_next(ident_t *loc, int gtid, kmp_int32 *p_last,
 #if KMP_USE_HIER_SCHED
             pr->flags.use_hier = FALSE;
 #endif
-            if ((ST) num_done == th->th.th_team_nproc - 1) {
+
+if ((ST) num_done == th->th.th_team_nproc - 1) {
+                // Record completion of an overhead-aware loop execution.
+        std::lock_guard<std::mutex> lock(overheadAwareTrackingMutex);
+
+        const void *dispatchKey = static_cast<const void *>(sh);
+
+        auto activeIt = overheadAwareActiveLoops.find(dispatchKey);
+
+        if (activeIt != overheadAwareActiveLoops.end()) {
+            const long long endNs = overheadAwareNowNs();
+
+            auto stateIt =
+                overheadAwareLoopData.find(activeIt->second.loopName);
+
+            if (stateIt != overheadAwareLoopData.end()) {
+                OverheadAwareState &state = stateIt->second;
+
+                const long long elapsedNs =
+                    endNs - activeIt->second.startTimeNs;
+
+                if (elapsedNs >= 0) {
+                    state.lastExecutionTimeNs = elapsedNs;
+                    state.completedRounds++;
+
+                    // Round 1 is treated as warm-up.
+                    // Rounds 2, 3, and 4 collect STATIC baseline measurements.
+                    if (state.completedRounds >= 2 &&
+                        state.completedRounds <= 4 &&
+                        state.evaluationPhase == 0) {
+
+                        state.baselineTimeNs += static_cast<double>(elapsedNs);
+                        state.baselineSamples++;
+
+                        const char *measureEnv =
+                            getenv("LB4OMP_MEASURE_ADAPTATION");
+
+                        if (measureEnv != nullptr && measureEnv[0] == '1') {
+                            std::cerr
+                                << "[LB4OMP_BASELINE]"
+                                << " round=" << state.completedRounds
+                                << " samples=" << state.baselineSamples
+                                << " elapsed_ns=" << elapsedNs
+                                << std::endl;
+                        }
+                    }
+
+                    // ============================================================
+                    // Phase 2: Collect GUIDED candidate measurements.
+                    // Rounds 5, 6, and 7.
+                    // ============================================================
+                    if (state.completedRounds >= 5 &&
+                        state.completedRounds <= 7 &&
+                        state.evaluationPhase == 1 &&
+                        state.currentPolicy == 3) {
+
+                        state.candidateTimeNs += static_cast<double>(elapsedNs);
+                        state.candidateSamples++;
+
+                        const char *measureEnv =
+                            getenv("LB4OMP_MEASURE_ADAPTATION");
+
+                        if (measureEnv != nullptr && measureEnv[0] == '1') {
+                            std::cerr
+                                << "[LB4OMP_CANDIDATE]"
+                                << " round=" << state.completedRounds
+                                << " policy=" << state.currentPolicy
+                                << " samples=" << state.candidateSamples
+                                << " elapsed_ns=" << elapsedNs
+                                << std::endl;
+                        }
+                    }
+
+                    const char *measureEnv =
+                        getenv("LB4OMP_MEASURE_ADAPTATION");
+
+                    if (measureEnv != nullptr && measureEnv[0] == '1') {
+                        std::cerr
+                            << "[LB4OMP_LOOP_TIME]"
+                            << " round=" << state.completedRounds
+                            << " policy=" << state.currentPolicy
+                            << " elapsed_ns=" << elapsedNs
+                            << " elapsed_ms="
+                            << (static_cast<double>(elapsedNs) / 1000000.0)
+                            << std::endl;
+                    }
+                }
+            }
+
+            // The dispatch buffer can be reused by another loop.
+            overheadAwareActiveLoops.erase(activeIt);
+    }
+                // End of overhead-aware completion tracking.
 #if (KMP_STATIC_STEAL_ENABLED)
                 if (pr->schedule == kmp_sch_static_steal &&
                     traits_t<T>::type_size > 4) {
@@ -6899,6 +7321,16 @@ See @ref __kmpc_dispatch_fini_4
 void __kmpc_dispatch_fini_8u(ident_t *loc, kmp_int32 gtid) {
     __kmp_dispatch_finish<kmp_uint64>(gtid, loc);
 }
+
+/*!
+ * Compatibility entry point expected by newer Clang OpenMP code generation.
+ * The existing dispatch_fini functions retain their normal finalization work.
+ */
+void __kmpc_dispatch_deinit(ident_t *loc, kmp_int32 gtid) {
+    (void)loc;
+    (void)gtid;
+}
+
 /*! @} */
 
 //-----------------------------------------------------------------------------

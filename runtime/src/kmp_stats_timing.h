@@ -18,6 +18,7 @@
 #include <limits>
 #include <stdint.h>
 #include <string>
+#include <iostream>
 #if KMP_HAVE_X86INTRIN_H
 #include <x86intrin.h>
 #endif
@@ -88,14 +89,14 @@ inline tsc_tick_count::tsc_interval_t operator-(const tsc_tick_count &t1,
 // added here the tick time definition to enable using it without enabling LIBOMP_STATS by Ali
 #if KMP_HAVE_TICK_TIME
 #if KMP_MIC
-double tsc_tick_count::tick_time() {
+inline double tsc_tick_count::tick_time() {
   // pretty bad assumption of 1GHz clock for MIC
   return 1 / ((double)1000 * 1.e6);
 }
 #elif KMP_ARCH_X86 || KMP_ARCH_X86_64
 #include <string.h>
 // Extract the value from the CPUID information
-double tsc_tick_count::tick_time() {
+inline double tsc_tick_count::tick_time() {
   static double result = 0.0;
 
   if (result == 0.0) {

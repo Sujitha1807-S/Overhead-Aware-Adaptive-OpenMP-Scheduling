@@ -7,6 +7,7 @@
 
 
 #include <iostream>
+#include <vector>
 #include <iomanip>
 #include "utils.h"
 
@@ -129,7 +130,7 @@ double sum(const double *array, int length) {
  * Searches for the best action (index) for a given state (using the Q-Values).
  * */
 int argmax(double **ref_table, int next_state, int size) {
-    double actions_avg[size] = {0};
+    std::vector<double> actions_avg(size, 0.0);
     double best_current = -9999;
     int best_index = 0;
 
